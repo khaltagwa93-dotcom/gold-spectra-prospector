@@ -1,0 +1,535 @@
+// ============================================================================
+// GOLD SPECTRA PROSPECTOR — Database Schema
+// PostgreSQL + PostGIS. Run `CREATE EXTENSION IF NOT EXISTS postgis;` once
+// on the target database before the first migration (see ARCHITECTURE.md).
+//
+// Geometry columns use Prisma's Unsupported() escape hatch because Prisma
+// has no native PostGIS type. A follow-up raw-SQL migration
+// (prisma/migrations/*_add_gist_indexes/migration.sql) adds the GiST
+// spatial indexes — Prisma cannot generate those on its own.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Auth (NextAuth.js Prisma adapter shape) + application user
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  passwordHash  String?
+  emailVerified DateTime?
+  image         String?
+  role          UserRole  @default(USER)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  accounts Account[]
+  sessions Session[]
+  projects Project[]
+  systemLogs SystemLog[]
+
+  @@map("users")
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Projects & study areas
+// ---------------------------------------------------------------------------
+
+enum ProjectStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+model Project {
+  id          String        @id @default(cuid())
+  ownerId     String
+  name        String
+  description String?
+  status      ProjectStatus @default(ACTIVE)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  owner       User          @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  studyAreas  StudyArea[]
+  analysisJobs AnalysisJob[]
+  reports     Report[]
+  exports     Export[]
+
+  @@index([ownerId])
+  @@map("projects")
+}
+
+enum StudyAreaSource {
+  GOOGLE_MAPS_URL
+  MANUAL_POINT
+  MANUAL_CIRCLE
+  MANUAL_RECTANGLE
+  MANUAL_POLYGON
+}
+
+model StudyArea {
+  id          String          @id @default(cuid())
+  projectId   String
+  name        String?
+  sourceType  StudyAreaSource
+  sourceUrl   String?
+  placeName   String?
+  zoomLevel   Int?
+  centerLat   Float
+  centerLng   Float
+  areaKm2     Float
+  // Polygon outline of the AOI in WGS84 (EPSG:4326)
+  geometry    Unsupported("geometry(Polygon, 4326)")
+  boundingBox Json
+  createdAt   DateTime        @default(now())
+
+  project           Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  analysisJobs      AnalysisJob[]
+  satelliteScenes   SatelliteScene[]
+  geologicalLayers  GeologicalLayer[]
+  terrainFeatures   TerrainFeature[]
+  lineaments        Lineament[]
+
+  @@index([projectId])
+  @@map("study_areas")
+}
+
+// ---------------------------------------------------------------------------
+// Analysis jobs (the async pipeline described in ARCHITECTURE.md §5)
+// ---------------------------------------------------------------------------
+
+enum AnalysisJobStatus {
+  PENDING
+  PARSING_LOCATION
+  CHECKING_AVAILABILITY
+  ACQUIRING_DATA
+  QUALITY_CONTROL
+  SPECTRAL_PROCESSING
+  GEOLOGICAL_ANALYSIS
+  TERRAIN_ANALYSIS
+  LINEAMENT_EXTRACTION
+  EVIDENCE_FUSION
+  PROSPECTIVITY_MODELING
+  GENERATING_MAP
+  GENERATING_REPORT
+  DONE
+  PARTIAL
+  FAILED
+}
+
+model AnalysisJob {
+  id              String            @id @default(cuid())
+  projectId       String
+  studyAreaId     String
+  status          AnalysisJobStatus @default(PENDING)
+  progressPercent Int               @default(0)
+  settings        Json
+  // e.g. { "Sentinel-2 unavailable for AOI, Landsat used instead": true }
+  partialReasons  Json?
+  errorMessage    String?
+  startedAt       DateTime?
+  completedAt     DateTime?
+  createdBy       String
+  createdAt       DateTime          @default(now())
+
+  project    Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  studyArea  StudyArea  @relation(fields: [studyAreaId], references: [id], onDelete: Cascade)
+
+  spectralFeatures     SpectralFeature[]
+  lineaments           Lineament[]
+  prospectivityResults ProspectivityResult[]
+  reports              Report[]
+  exports              Export[]
+
+  @@index([projectId])
+  @@index([studyAreaId])
+  @@map("analysis_jobs")
+}
+
+// ---------------------------------------------------------------------------
+// Satellite source catalogue + live connector health (kept separate:
+// satellite_sources describes *sensors*, api_sources describes *connectors*)
+// ---------------------------------------------------------------------------
+
+enum SatelliteSourceName {
+  SENTINEL2_MSI
+  LANDSAT_8_9
+  ASTER
+  ENMAP
+  NASA_EMIT
+}
+
+model SatelliteSource {
+  id               String              @id @default(cuid())
+  name             SatelliteSourceName @unique
+  displayName      String
+  provider         String
+  bands            Json
+  resolutionMeters Float
+  revisitDays      Float?
+  isHyperspectral  Boolean             @default(false)
+  notes            String?
+
+  scenes SatelliteScene[]
+
+  @@map("satellite_sources")
+}
+
+enum ApiSourceStatus {
+  AVAILABLE
+  PARTIALLY_AVAILABLE
+  UNAVAILABLE
+  AUTHENTICATION_REQUIRED
+  PROCESSING_FAILED
+  NOT_CONFIGURED
+}
+
+model ApiSource {
+  id                 String          @id @default(cuid())
+  key                String          @unique // matches an entry in src/lib/connectors/registry.ts
+  displayName        String
+  status             ApiSourceStatus @default(NOT_CONFIGURED)
+  isEnabledByAdmin   Boolean         @default(true)
+  lastCheckedAt      DateTime?
+  lastSuccessAt      DateTime?
+  lastErrorAt        DateTime?
+  lastErrorMessage   String?
+  // Non-secret config only (e.g. base URL, collection name). Real credentials
+  // live in environment variables / a secrets manager — never in this table.
+  config             Json?
+  updatedAt          DateTime        @updatedAt
+
+  @@map("api_sources")
+}
+
+// ---------------------------------------------------------------------------
+// Satellite scenes actually retrieved for a study area
+// ---------------------------------------------------------------------------
+
+enum SceneStatus {
+  FOUND
+  DOWNLOADING
+  DOWNLOADED
+  FAILED
+}
+
+model SatelliteScene {
+  id                String            @id @default(cuid())
+  studyAreaId       String
+  satelliteSourceId String
+  externalSceneId   String
+  acquisitionDate   DateTime
+  cloudCoverPercent Float?
+  resolutionMeters  Float
+  footprint         Unsupported("geometry(Polygon, 4326)")
+  bandsAvailable    Json
+  qualityScore      Float?
+  storageUrl        String?
+  status            SceneStatus       @default(FOUND)
+  retrievedAt       DateTime          @default(now())
+
+  studyArea       StudyArea       @relation(fields: [studyAreaId], references: [id], onDelete: Cascade)
+  satelliteSource SatelliteSource @relation(fields: [satelliteSourceId], references: [id])
+  spectralFeatures SpectralFeature[]
+
+  @@unique([satelliteSourceId, externalSceneId])
+  @@index([studyAreaId])
+  @@map("satellite_scenes")
+}
+
+// ---------------------------------------------------------------------------
+// Spectral analysis outputs
+// ---------------------------------------------------------------------------
+
+enum SpectralFeatureType {
+  IRON_OXIDE
+  FERRIC_IRON
+  FERROUS_IRON
+  CLAY
+  HYDROXYL_ALTERATION
+  CARBONATE
+  SILICA
+  VEGETATION_MASK
+  BARE_SOIL_MASK
+  EXPOSED_ROCK_MASK
+  MOISTURE_MASK
+  SURFACE_TEMPERATURE
+  SPECTRAL_ANOMALY
+}
+
+enum SpectralMethod {
+  BAND_RATIO
+  NORMALIZED_DIFFERENCE
+  PCA
+  SPECTRAL_ANGLE_MAPPER
+  ANOMALY_DETECTION
+  SPECTRAL_UNMIXING
+}
+
+model SpectralFeature {
+  id               String              @id @default(cuid())
+  analysisJobId    String
+  satelliteSceneId String
+  featureType      SpectralFeatureType
+  method           SpectralMethod
+  rasterUrl        String
+  stats            Json // { min, max, mean, stdDev, validPixelPercent }
+  createdAt        DateTime            @default(now())
+
+  analysisJob    AnalysisJob    @relation(fields: [analysisJobId], references: [id], onDelete: Cascade)
+  satelliteScene SatelliteScene @relation(fields: [satelliteSceneId], references: [id], onDelete: Cascade)
+
+  @@index([analysisJobId])
+  @@map("spectral_features")
+}
+
+// ---------------------------------------------------------------------------
+// Geological context layers (only populated when a real source is available)
+// ---------------------------------------------------------------------------
+
+enum GeologicalLayerType {
+  FORMATION
+  LITHOLOGY
+  FAULT
+  FRACTURE
+  CONTACT
+  STRUCTURAL_TREND
+  KNOWN_MINERAL_OCCURRENCE
+  ALTERATION_ZONE
+  GEOCHEMICAL
+}
+
+model GeologicalLayer {
+  id          String              @id @default(cuid())
+  studyAreaId String
+  layerType   GeologicalLayerType
+  sourceName  String
+  sourceUrl   String?
+  geometry    Unsupported("geometry(Geometry, 4326)")
+  properties  Json
+  retrievedAt DateTime            @default(now())
+
+  studyArea StudyArea @relation(fields: [studyAreaId], references: [id], onDelete: Cascade)
+
+  @@index([studyAreaId])
+  @@map("geological_layers")
+}
+
+// ---------------------------------------------------------------------------
+// Terrain / DEM-derived features
+// ---------------------------------------------------------------------------
+
+model TerrainFeature {
+  id                 String   @id @default(cuid())
+  studyAreaId        String
+  demSource          String   // e.g. "SRTM 30m"
+  elevationRasterUrl String?
+  slopeRasterUrl     String?
+  aspectRasterUrl    String?
+  hillshadeRasterUrl String?
+  curvatureRasterUrl String?
+  roughnessRasterUrl String?
+  drainageGeoJson    Json?
+  createdAt          DateTime @default(now())
+
+  studyArea StudyArea @relation(fields: [studyAreaId], references: [id], onDelete: Cascade)
+
+  @@index([studyAreaId])
+  @@map("terrain_features")
+}
+
+// ---------------------------------------------------------------------------
+// Lineaments — always labeled "potential" until corroborated by geological data
+// ---------------------------------------------------------------------------
+
+model Lineament {
+  id                    String    @id @default(cuid())
+  studyAreaId           String
+  analysisJobId         String
+  geometry              Unsupported("geometry(LineString, 4326)")
+  orientationDegrees    Float
+  lengthMeters          Float
+  label                 String    @default("Potential Lineament")
+  corroboratedByGeology Boolean   @default(false)
+  createdAt             DateTime  @default(now())
+
+  studyArea   StudyArea   @relation(fields: [studyAreaId], references: [id], onDelete: Cascade)
+  analysisJob AnalysisJob @relation(fields: [analysisJobId], references: [id], onDelete: Cascade)
+
+  @@index([studyAreaId])
+  @@index([analysisJobId])
+  @@map("lineaments")
+}
+
+// ---------------------------------------------------------------------------
+// Prospectivity — the explainable, weighted evidence-fusion result
+// ---------------------------------------------------------------------------
+
+enum ConfidenceLevel {
+  VERY_LOW
+  LOW
+  MODERATE
+  HIGH
+}
+
+model ProspectivityResult {
+  id                String          @id @default(cuid())
+  analysisJobId     String
+  dataQualityScore  Int // 0-100
+  confidenceLevel   ConfidenceLevel
+  overallScore      Int // 0-100, see src/lib/prospectivity/scoring.ts for bands
+  weightsUsed        Json  // normalized weights actually applied (unavailable
+                            // factors are excluded and the rest re-normalized —
+                            // never assigned a fabricated weight)
+  evidenceBreakdown Json  // per-factor: rawEvidence, normalizedContribution,
+                          // weight, contributionToScore, dataSource,
+                          // acquisitionDate, resolution, algorithm, limitations
+  methodologyNote   String @default("Prospectivity score, not a calibrated probability of gold occurrence.")
+  createdAt         DateTime @default(now())
+
+  analysisJob AnalysisJob         @relation(fields: [analysisJobId], references: [id], onDelete: Cascade)
+  zones       ProspectivityZone[]
+
+  @@index([analysisJobId])
+  @@map("prospectivity_results")
+}
+
+model ProspectivityZone {
+  id                     String   @id @default(cuid())
+  prospectivityResultId  String
+  rank                   Int
+  score                  Int
+  geometry               Unsupported("geometry(Polygon, 4326)")
+  centerLat              Float
+  centerLng              Float
+  areaKm2                Float
+  evidenceSummary        Json
+  dataQualityScore       Int
+  confidenceLevel        ConfidenceLevel
+  createdAt              DateTime @default(now())
+
+  prospectivityResult ProspectivityResult @relation(fields: [prospectivityResultId], references: [id], onDelete: Cascade)
+
+  @@index([prospectivityResultId])
+  @@map("prospectivity_zones")
+}
+
+// ---------------------------------------------------------------------------
+// Reports & GIS exports
+// ---------------------------------------------------------------------------
+
+model Report {
+  id            String   @id @default(cuid())
+  projectId     String
+  analysisJobId String
+  fileUrl       String
+  generatedBy   String
+  generatedAt   DateTime @default(now())
+
+  project     Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  analysisJob AnalysisJob @relation(fields: [analysisJobId], references: [id], onDelete: Cascade)
+
+  @@map("reports")
+}
+
+enum ExportFormat {
+  GEOJSON
+  KML
+  CSV
+  GEOTIFF
+}
+
+model Export {
+  id            String       @id @default(cuid())
+  projectId     String
+  analysisJobId String
+  format        ExportFormat
+  layerName     String
+  fileUrl       String
+  createdAt     DateTime     @default(now())
+
+  project     Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  analysisJob AnalysisJob @relation(fields: [analysisJobId], references: [id], onDelete: Cascade)
+
+  @@map("exports")
+}
+
+// ---------------------------------------------------------------------------
+// System logs (admin dashboard + audit trail)
+// ---------------------------------------------------------------------------
+
+enum LogLevel {
+  INFO
+  WARN
+  ERROR
+}
+
+model SystemLog {
+  id        String   @id @default(cuid())
+  level     LogLevel
+  scope     String // e.g. "connector:sentinel2", "auth", "analysis-job:xyz"
+  message   String
+  metadata  Json?
+  userId    String?
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([scope])
+  @@index([createdAt])
+  @@map("system_logs")
+}
